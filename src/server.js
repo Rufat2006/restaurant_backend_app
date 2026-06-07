@@ -1,90 +1,15 @@
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import morgan from "morgan";
-import bcrypt from "bcryptjs";
-import { z } from "zod";
-import dotenv from "dotenv";
-import db, { migrate } from "./db.js";
-import { signToken, requireAuth, requireRole } from "./auth.js";
-
-dotenv.config();
-migrate();
-const app = express();
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(cors({ origin: process.env.CORS_ORIGIN === "*" ? true : (process.env.CORS_ORIGIN || true) }));
-app.use(express.json({ limit:"1mb" }));
-app.use(morgan("dev"));
-
-const menuSchema = z.object({
-  enName: z.string().min(1), azName: z.string().min(1), description: z.string().optional().default(""),
-  category: z.string().min(1).default("General"), price: z.number().nonnegative(), imageUrl: z.string().optional().default(""),
-  available: z.boolean().default(true), sortOrder: z.number().int().optional().default(0)
-});
-
-app.get("/", (_,res) => res.json({ ok:true, app:"Restaurant POS Old Backend", health:"/health" }));
-app.get("/health", (_,res) => res.json({ ok:true }));
-
-app.post("/api/auth/login", (req,res) => {
-  const { username, password } = req.body;
-  const user = db.prepare("SELECT * FROM users WHERE username=?").get(username);
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error:"Wrong username or password" });
-  res.json({ token: signToken(user), user:{ id:user.id, name:user.name, username:user.username, role:user.role } });
-});
-
-app.get("/api/menu", (_,res) => {
-  const rows = db.prepare(`SELECT id, en_name enName, az_name azName, description, category, price, image_url imageUrl, available, sort_order sortOrder FROM menu_items ORDER BY sort_order, category, en_name`).all();
-  res.json(rows.map(r => ({ ...r, available: !!r.available })));
-});
-app.post("/api/menu", requireAuth, requireRole("admin"), (req,res) => {
-  const item = menuSchema.parse(req.body);
-  const info = db.prepare(`INSERT INTO menu_items(en_name,az_name,description,category,price,image_url,available,sort_order) VALUES(?,?,?,?,?,?,?,?)`).run(item.enName,item.azName,item.description,item.category,item.price,item.imageUrl,item.available?1:0,item.sortOrder);
-  res.status(201).json({ id: info.lastInsertRowid, ...item });
-});
-app.put("/api/menu/:id", requireAuth, requireRole("admin"), (req,res) => {
-  const item = menuSchema.parse(req.body);
-  db.prepare(`UPDATE menu_items SET en_name=?,az_name=?,description=?,category=?,price=?,image_url=?,available=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(item.enName,item.azName,item.description,item.category,item.price,item.imageUrl,item.available?1:0,item.sortOrder,req.params.id);
-  res.json({ id:Number(req.params.id), ...item });
-});
-app.delete("/api/menu/:id", requireAuth, requireRole("admin"), (req,res) => {
-  db.prepare("DELETE FROM menu_items WHERE id=?").run(req.params.id);
-  res.json({ success:true });
-});
-
-app.post("/api/orders", requireAuth, requireRole("admin","cashier"), (req,res) => {
-  const { tableNo="", orderType, paymentMethod, discount=0, servicePct=0, vatPct=0, items=[] } = req.body;
-  if (!items.length) return res.status(400).json({ error:"Order is empty" });
-  const rows = items.map(i => db.prepare("SELECT * FROM menu_items WHERE id=? AND available=1").get(i.id));
-  if (rows.some(x => !x)) return res.status(400).json({ error:"Some menu items are unavailable" });
-  const lines = items.map((it,idx) => ({ item:rows[idx], qty:Math.max(1, Number(it.qty || 1)) }));
-  const subtotal = lines.reduce((s,l)=>s+l.item.price*l.qty,0);
-  const service = subtotal * Number(servicePct) / 100;
-  const vat = (subtotal - Number(discount) + service) * Number(vatPct) / 100;
-  const total = subtotal - Number(discount) + service + vat;
-  const orderNo = "R" + Date.now();
-  const tx = db.transaction(() => {
-    const info = db.prepare(`INSERT INTO orders(order_no,table_no,order_type,payment_method,subtotal,discount,service,vat,total,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(orderNo,tableNo,orderType,paymentMethod,subtotal,Number(discount),service,vat,total,req.user.id);
-    const orderId = info.lastInsertRowid;
-    const stmt = db.prepare(`INSERT INTO order_items(order_id,menu_item_id,name,unit_price,qty,line_total) VALUES(?,?,?,?,?,?)`);
-    for (const l of lines) stmt.run(orderId,l.item.id,l.item.en_name,l.item.price,l.qty,l.item.price*l.qty);
-    return orderId;
-  });
-  const id = tx();
-  res.status(201).json({ id, orderNo, subtotal, discount:Number(discount), service, vat, total });
-});
-app.get("/api/orders", requireAuth, requireRole("admin","cashier","kitchen"), (_,res) => {
-  res.json(db.prepare(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 300`).all());
-});
-app.patch("/api/orders/:id/status", requireAuth, requireRole("admin","kitchen","cashier"), (req,res) => {
-  const status = z.enum(["new","preparing","ready","served","cancelled"]).parse(req.body.status);
-  db.prepare("UPDATE orders SET status=? WHERE id=?").run(status, req.params.id);
-  res.json({ success:true });
-});
-app.get("/api/reports/sales", requireAuth, requireRole("admin"), (_,res) => {
-  const summary = db.prepare(`SELECT COUNT(*) orders, COALESCE(SUM(subtotal),0) gross, COALESCE(SUM(total),0) net FROM orders WHERE status != 'cancelled'`).get();
-  const topItems = db.prepare(`SELECT name, SUM(qty) qty, SUM(line_total) sales FROM order_items GROUP BY name ORDER BY sales DESC LIMIT 10`).all();
-  res.json({ summary, topItems });
-});
-
-const port = Number(process.env.PORT || 3000);
-app.listen(port, "0.0.0.0", () => console.log(`Restaurant POS backend running on port ${port}`));
+import express from "express";import cors from "cors";import helmet from "helmet";import morgan from "morgan";import bcrypt from "bcryptjs";import {z} from "zod";import dotenv from "dotenv";
+import db,{migrate} from "./db.js";import {signToken,requireAuth,requireRole} from "./auth.js";
+dotenv.config();migrate();const app=express();app.use(helmet({crossOriginResourcePolicy:false}));app.use(cors({origin:process.env.CORS_ORIGIN==="*"?true:(process.env.CORS_ORIGIN||true)}));app.use(express.json({limit:"1mb"}));app.use(morgan("dev"));
+const menuSchema=z.object({enName:z.string().min(1),azName:z.string().min(1),description:z.string().optional().default(""),category:z.string().min(1).default("General"),price:z.number().nonnegative(),imageUrl:z.string().optional().default(""),available:z.boolean().default(true),sortOrder:z.number().int().optional().default(0)});
+app.get("/",(_,res)=>res.json({ok:true,app:"Restaurant POS Old EN/RU Backend",health:"/health"}));app.get("/health",(_,res)=>res.json({ok:true}));
+app.post("/api/auth/login",(req,res)=>{const{username,password}=req.body;const u=db.prepare("SELECT * FROM users WHERE username=?").get(username);if(!u||!bcrypt.compareSync(password,u.password_hash))return res.status(401).json({error:"Wrong username or password"});res.json({token:signToken(u),user:{id:u.id,name:u.name,username:u.username,role:u.role}})});
+app.get("/api/menu",(_,res)=>{const rows=db.prepare(`SELECT id,en_name enName,az_name azName,description,category,price,image_url imageUrl,available,sort_order sortOrder FROM menu_items ORDER BY sort_order,category,en_name`).all();res.json(rows.map(r=>({...r,available:!!r.available})))});
+app.post("/api/menu",requireAuth,requireRole("admin"),(req,res)=>{const i=menuSchema.parse(req.body);const info=db.prepare(`INSERT INTO menu_items(en_name,az_name,description,category,price,image_url,available,sort_order) VALUES(?,?,?,?,?,?,?,?)`).run(i.enName,i.azName,i.description,i.category,i.price,i.imageUrl,i.available?1:0,i.sortOrder);res.status(201).json({id:info.lastInsertRowid,...i})});
+app.put("/api/menu/:id",requireAuth,requireRole("admin"),(req,res)=>{const i=menuSchema.parse(req.body);db.prepare(`UPDATE menu_items SET en_name=?,az_name=?,description=?,category=?,price=?,image_url=?,available=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(i.enName,i.azName,i.description,i.category,i.price,i.imageUrl,i.available?1:0,i.sortOrder,req.params.id);res.json({id:Number(req.params.id),...i})});
+app.delete("/api/menu/:id",requireAuth,requireRole("admin"),(req,res)=>{db.prepare("DELETE FROM menu_items WHERE id=?").run(req.params.id);res.json({success:true})});
+app.post("/api/orders",requireAuth,requireRole("admin","cashier"),(req,res)=>{const{tableNo="",orderType,paymentMethod,discount=0,servicePct=0,vatPct=0,items=[]}=req.body;if(!items.length)return res.status(400).json({error:"Order is empty"});const rows=items.map(i=>db.prepare("SELECT * FROM menu_items WHERE id=? AND available=1").get(i.id));if(rows.some(x=>!x))return res.status(400).json({error:"Some menu items are unavailable"});const lines=items.map((it,idx)=>({item:rows[idx],qty:Math.max(1,Number(it.qty||1))}));const subtotal=lines.reduce((s,l)=>s+l.item.price*l.qty,0);const service=subtotal*Number(servicePct)/100;const vat=(subtotal-Number(discount)+service)*Number(vatPct)/100;const total=subtotal-Number(discount)+service+vat;const orderNo="R"+Date.now();const tx=db.transaction(()=>{const info=db.prepare(`INSERT INTO orders(order_no,table_no,order_type,payment_method,subtotal,discount,service,vat,total,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(orderNo,tableNo,orderType,paymentMethod,subtotal,Number(discount),service,vat,total,req.user.id);const oid=info.lastInsertRowid;const stmt=db.prepare(`INSERT INTO order_items(order_id,menu_item_id,name,unit_price,qty,line_total) VALUES(?,?,?,?,?,?)`);for(const l of lines)stmt.run(oid,l.item.id,l.item.en_name,l.item.price,l.qty,l.item.price*l.qty);return oid});const id=tx();res.status(201).json({id,orderNo,subtotal,discount:Number(discount),service,vat,total})});
+app.get("/api/orders",requireAuth,requireRole("admin","cashier","kitchen"),(_,res)=>res.json(db.prepare(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 300`).all()));
+app.patch("/api/orders/:id/status",requireAuth,requireRole("admin","kitchen","cashier"),(req,res)=>{const status=z.enum(["new","preparing","ready","served","cancelled"]).parse(req.body.status);db.prepare("UPDATE orders SET status=? WHERE id=?").run(status,req.params.id);res.json({success:true})});
+app.get("/api/reports/sales",requireAuth,requireRole("admin"),(_,res)=>{const summary=db.prepare(`SELECT COUNT(*) orders,COALESCE(SUM(subtotal),0) gross,COALESCE(SUM(total),0) net FROM orders WHERE status!='cancelled'`).get();const topItems=db.prepare(`SELECT name,SUM(qty) qty,SUM(line_total) sales FROM order_items GROUP BY name ORDER BY sales DESC LIMIT 10`).all();res.json({summary,topItems})});
+const port=Number(process.env.PORT||3000);app.listen(port,"0.0.0.0",()=>console.log(`Restaurant POS EN/RU backend running on port ${port}`));
